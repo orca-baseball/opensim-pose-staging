@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+jobs/
+*.log
+STAGING_SECRET.txt

@@ -1,0 +1,1 @@
+# Render pose staging package
