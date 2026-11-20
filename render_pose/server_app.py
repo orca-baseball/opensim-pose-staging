@@ -9,7 +9,7 @@ from analyze_pose import load_frames
 JOBS=Path(os.environ.get('OPENSIM_JOBS_DIR',str(ROOT/'jobs')))
 JOBS.mkdir(parents=True,exist_ok=True)
 KEY=os.environ.get('OPENSIM_API_KEY','').strip()
-ORIGINS=set(os.environ.get('OPENSIM_ALLOWED_ORIGINS','capacitor://localhost,http://localhost,https://localhost,http://localhost:3000,http://127.0.0.1:3000').split(','))
+ORIGINS={o.strip() for o in os.environ.get('OPENSIM_ALLOWED_ORIGINS','capacitor://localhost,http://localhost,https://localhost,http://localhost:3000,http://127.0.0.1:3000').split(',') if o.strip()}
 app=Flask(__name__); app.config['MAX_CONTENT_LENGTH']=2*1024*1024
 lock=threading.RLock(); queue=deque(); active=None; started=False
 
