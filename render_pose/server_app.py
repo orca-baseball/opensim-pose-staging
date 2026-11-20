@@ -1,118 +1,146 @@
-"""Pose-only OpenSim API for a separate Render staging service.
-Does not replace Orca production analysis. Local Lab app.py is unchanged."""
+"""Isolated pose staging v2. Single-process bounded FIFO; not Orca production."""
 from pathlib import Path
-import os, sys, json, uuid, threading, subprocess, math
-from flask import Flask, request, jsonify, send_file
-
+import os, sys, json, uuid, threading, subprocess, time, hmac, hashlib, base64
+from collections import deque
+from flask import Flask, request, jsonify, send_file, g
 ROOT=Path(__file__).resolve().parents[1]
-os.chdir(ROOT)
-os.environ.setdefault('MPLCONFIGDIR',str(ROOT/'.matplotlib'))
-JOBS=Path(os.environ.get('OPENSIM_JOBS_DIR') or (ROOT/'jobs'))
+sys.path.insert(0,str(ROOT))
+from analyze_pose import load_frames
+JOBS=Path(os.environ.get('OPENSIM_JOBS_DIR',str(ROOT/'jobs')))
 JOBS.mkdir(parents=True,exist_ok=True)
-API_KEY=os.environ.get('OPENSIM_API_KEY','').strip()
-app=Flask(__name__)
-app.config['MAX_CONTENT_LENGTH']=32*1024*1024
-lock=threading.Lock(); active={}
+KEY=os.environ.get('OPENSIM_API_KEY','').strip()
+ORIGINS=set(os.environ.get('OPENSIM_ALLOWED_ORIGINS','capacitor://localhost,http://localhost,https://localhost,http://localhost:3000,http://127.0.0.1:3000').split(','))
+app=Flask(__name__); app.config['MAX_CONTENT_LENGTH']=2*1024*1024
+lock=threading.RLock(); queue=deque(); active=None; started=False
 
-def job_dir(key):
-    try: return JOBS/str(uuid.UUID(key))
-    except ValueError: return None
+def save(path,data):
+    tmp=path.with_suffix('.tmp'); tmp.write_text(json.dumps(data,ensure_ascii=False,allow_nan=False)); tmp.replace(path)
+
+def decode_token(token):
+    body,sig=token.split('.')
+    expected=hmac.new(KEY.encode(),body.encode(),hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig,expected): raise ValueError()
+    data=json.loads(base64.urlsafe_b64decode(body+'='*(-len(body)%4)))
+    if data.get('aud')!='opensim-staging' or not isinstance(data.get('sub'),str) or not data['sub']: raise ValueError()
+    now=time.time()
+    if not isinstance(data.get('exp'),(int,float)) or not now<data['exp']<=now+86400: raise ValueError()
+    return data['sub']
 
 @app.before_request
 def guard():
-    if request.path=='/api/health': return None
-    if API_KEY:
-        if request.headers.get('X-OpenSim-Key')!=API_KEY:
-            return jsonify(error='인증이 필요합니다.'),401
+    origin=request.headers.get('Origin')
+    if origin and origin not in ORIGINS: return jsonify(error='허용되지 않은 앱 출처입니다.'),403
+    if request.method=='OPTIONS': return '',204
+    if request.path=='/api/health': return
+    if not KEY: return jsonify(error='테스트 인증 설정이 필요합니다.'),503
+    try:
+        token=request.headers.get('Authorization','')
+        if not token.startswith('Bearer '): raise ValueError()
+        g.owner=decode_token(token[7:])
+    except (ValueError,TypeError,KeyError): return jsonify(error='테스트 코드가 없거나 만료되었습니다.'),401
+
+@app.after_request
+def cors(response):
+    origin=request.headers.get('Origin')
+    if origin in ORIGINS:
+        response.headers['Access-Control-Allow-Origin']=origin
+        response.headers['Vary']='Origin'
+        response.headers['Access-Control-Allow-Headers']='Content-Type, Authorization, X-Request-ID'
+        response.headers['Access-Control-Allow-Methods']='GET, POST, DELETE, OPTIONS'
+    response.headers['Cache-Control']='no-store'
+    return response
+
+@app.errorhandler(413)
+def oversized(_): return jsonify(error='관절 데이터가 너무 큽니다.'),413
+
+def ensure_worker():
+    global started
+    with lock:
+        if started: return
+        # Jobs use temporary storage: after restart explicitly fail unfinished requests.
+        for p in JOBS.glob('*/status.json'):
+            try:
+                s=json.loads(p.read_text())
+                if s.get('state') in ('running','queued'): save(p,dict(state='error',message='테스트 서버가 재시작되었습니다. 좌표 전송을 다시 눌러주세요.'))
+            except (OSError,ValueError): pass
+        started=True
+        threading.Thread(target=worker,daemon=True).start()
+
+def worker():
+    global active
+    while True:
+        with lock:
+            key=queue.popleft() if queue else None
+            active=key
+        if not key: time.sleep(.15); continue
+        folder=JOBS/key
+        save(folder/'status.json',dict(state='running',progress=1,message='OpenSim 계산 중'))
+        try:
+            with (folder/'worker.log').open('w') as log:
+                p=subprocess.Popen([sys.executable,str(ROOT/'analyze_pose.py'),str(folder)],cwd=ROOT,stdout=log,stderr=log)
+                try: p.wait(timeout=600)
+                except subprocess.TimeoutExpired:
+                    p.kill(); p.wait(); raise RuntimeError('계산 시간이 초과됐습니다.')
+                status=json.loads((folder/'status.json').read_text())
+                if p.returncode or status.get('state')!='done':
+                    if status.get('state')!='error': raise RuntimeError('계산에 실패했습니다.')
+        except Exception as e:
+            save(folder/'status.json',dict(state='error',message=str(e) if isinstance(e,RuntimeError) else '계산 작업을 완료하지 못했습니다.'))
+        finally:
+            with lock: active=None
+
+def owned(key):
+    try: folder=JOBS/str(uuid.UUID(key)); meta=json.loads((folder/'meta.json').read_text())
+    except (ValueError,OSError): return None
+    return folder if meta.get('owner')==g.owner else None
 
 @app.get('/api/health')
-def health():
-    return jsonify(app='orca-opensim-pose',version=1,mode='render_pose',opensim='4.6')
-
-def monitor(key,process,log):
-    try:
-        process.wait(timeout=600)
-        folder=JOBS/key
-        path=folder/'status.json'
-        if process.returncode and (not path.exists() or json.loads(path.read_text()).get('state')=='running'):
-            path.write_text(json.dumps({'state':'error','message':'분석 엔진이 종료됐습니다.'},ensure_ascii=False))
-    except subprocess.TimeoutExpired:
-        process.kill(); process.wait()
-        (JOBS/key/'status.json').write_text(json.dumps({'state':'error','message':'분석 시간이 10분을 초과했습니다.'},ensure_ascii=False))
-    finally:
-        log.close()
-        with lock: active.clear()
-
-def start_job(options,message):
-    with lock:
-        if active: return None, (jsonify(error='다른 분석을 처리 중입니다. 완료 후 다시 시도해주세요.'),409)
-        key=str(uuid.uuid4()); folder=JOBS/key; folder.mkdir()
-        (folder/'options.json').write_text(json.dumps(options,ensure_ascii=False))
-        (folder/'status.json').write_text(json.dumps(dict(state='running',progress=1,message=message),ensure_ascii=False))
-        log=(folder/'worker.log').open('w')
-        try: process=subprocess.Popen([sys.executable,str(ROOT/'analyze_pose.py'),str(folder)],cwd=ROOT,stdout=log,stderr=log)
-        except Exception:
-            log.close(); return None, (jsonify(error='분석 엔진을 실행하지 못했습니다.'),500)
-        active.update(key=key,process=process)
-        threading.Thread(target=monitor,args=(key,process,log),daemon=True).start()
-        return key, None
+def health(): return jsonify(app='orca-opensim-pose',apiVersion=2,mode='render_pose',auth='short-lived-test-token',maxFrames=901)
 
 @app.post('/api/analyze-pose')
-def analyze_pose_api():
+def submit():
     data=request.get_json(silent=True)
-    if not isinstance(data,dict): return jsonify(error='JSON body가 필요합니다.'),400
-    frames=data.get('frames')
-    if not isinstance(frames,list) or len(frames)<12:
-        return jsonify(error='frames는 최소 12개 장면이 필요합니다.'),400
-    space=data.get('coordinateSpace','mediapipe_world')
-    if space not in ('mediapipe_world','lab'):
-        return jsonify(error='coordinateSpace는 mediapipe_world 또는 lab 이어야 합니다.'),400
-    factor=data.get('factor',None)
-    try:
-        if factor is not None:
-            if isinstance(factor,bool) or not isinstance(factor,(int,float)) or not math.isfinite(factor) or not 1<=float(factor)<=32:
-                raise ValueError('슬로모션 배율을 확인해주세요.')
-            factor=float(factor)
-        joints=('leftHip','rightHip','leftShoulder','rightShoulder'); prev=None
-        for i,frame in enumerate(frames):
-            if not isinstance(frame,dict): raise ValueError(f'frames[{i}] 형식이 올바르지 않습니다.')
-            t=frame.get('t')
-            if isinstance(t,bool) or not isinstance(t,(int,float)) or not math.isfinite(t) or t<0:
-                raise ValueError(f'frames[{i}].t 시간을 확인해주세요.')
-            t=float(t)
-            if prev is not None and t<=prev: raise ValueError('frames의 t는 증가하는 초 단위여야 합니다.')
-            prev=t
-            for name in joints:
-                xyz=frame.get(name)
-                if not isinstance(xyz,(list,tuple)) or len(xyz)!=3:
-                    raise ValueError(f'frames[{i}].{name}는 [x,y,z] 배열이어야 합니다.')
-                if any(isinstance(n,bool) or not isinstance(n,(int,float)) or not math.isfinite(n) for n in xyz):
-                    raise ValueError(f'frames[{i}].{name} 좌표가 올바르지 않습니다.')
-            if 'usable' in frame and not isinstance(frame['usable'],bool):
-                raise ValueError(f'frames[{i}].usable는 true/false여야 합니다.')
-        span=float(frames[-1]['t'])-float(frames[0]['t'])
-        if span<=0 or span>30.1: raise ValueError('분석 구간은 0초보다 길고 최대 30초로 보내주세요.')
-    except ValueError as e:
-        return jsonify(error=str(e)),400
-    key,err=start_job(dict(coordinateSpace=space,factor=factor,frames=frames),'관절 좌표 준비 중')
-    if err: return err
-    return jsonify(id=key)
+    if not isinstance(data,dict): return jsonify(error='관절 JSON이 필요합니다.'),400
+    if not isinstance(data.get('frames'),list) or not 12<=len(data['frames'])<=901: return jsonify(error='12~901개 장면이 필요합니다.'),400
+    if any(not isinstance(f,dict) or not isinstance(f.get('usable'),bool) for f in data['frames']): return jsonify(error='모든 장면의 usable 품질 표시가 필요합니다.'),400
+    try: load_frames(data)
+    except (ValueError,TypeError,KeyError) as e: return jsonify(error=str(e)),400
+    try: request_id=str(uuid.UUID(request.headers.get('X-Request-ID','')))
+    except ValueError: return jsonify(error='유효한 요청 ID가 필요합니다.'),400
+    ensure_worker()
+    with lock:
+        # Idempotent retries survive client disconnect and token refresh with same subject.
+        for mp in JOBS.glob('*/meta.json'):
+            try:
+                m=json.loads(mp.read_text())
+                if m.get('owner')==g.owner and m.get('requestId')==request_id: return jsonify(id=mp.parent.name)
+            except (OSError,ValueError): pass
+        pending=([active] if active else [])+list(queue)
+        for key in pending:
+            if owned(key): return jsonify(error='이미 요청한 분석이 있습니다.',id=key),409
+        if len(pending)>=10: return jsonify(error='테스트 대기열이 가득 찼습니다. 잠시 후 다시 전송해주세요.'),429
+        key=str(uuid.uuid4()); folder=JOBS/key; folder.mkdir()
+        save(folder/'options.json',data)
+        save(folder/'meta.json',dict(owner=g.owner,requestId=request_id,created=time.time()))
+        save(folder/'status.json',dict(state='queued',progress=0,message='분석 대기 중'))
+        queue.append(key)
+    return jsonify(id=key),202
 
 @app.get('/api/jobs/<key>')
 def status(key):
-    folder=job_dir(key)
-    if folder is None or not (folder/'status.json').exists(): return jsonify(error='분석 기록이 없습니다.'),404
-    data=json.loads((folder/'status.json').read_text())
+    ensure_worker(); folder=owned(key)
+    if not folder: return jsonify(error='분석 기록을 찾을 수 없습니다.'),404
+    with lock:
+        data=json.loads((folder/'status.json').read_text())
+        if key in queue: data['queuePosition']=list(queue).index(key)+1+(1 if active else 0)
+        elif key==active and data.get('state')=='queued': data['state']='running'
     if data.get('state')=='done': data['result']=json.loads((folder/'result.json').read_text())
     return jsonify(data)
 
 @app.get('/api/jobs/<key>/files/<name>')
-def download(key,name):
-    folder=job_dir(key)
-    allowed=('measurements.csv','model.osim','motion.mot','markers.trc','result.json')
-    if folder is None or name not in allowed or not (folder/name).is_file(): return '',404
+def files(key,name):
+    folder=owned(key)
+    if not folder or name not in ('measurements.csv','model.osim','motion.mot','markers.trc','result.json') or not (folder/name).is_file(): return '',404
     return send_file(folder/name,as_attachment=True,conditional=True)
 
-if __name__=='__main__':
-    port=int(os.environ.get('PORT','10000'))
-    app.run(host='0.0.0.0',port=port,threaded=True,debug=False)
+if __name__=='__main__': app.run(host='127.0.0.1',port=int(os.environ.get('PORT','8766')),threaded=True)
